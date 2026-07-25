@@ -170,9 +170,16 @@ def build_comparison(records, meta, route_pair=DEFAULT_ROUTE, month=None, combin
     for m in months:
         m_recs = [r for r in matched if r.get("reference_month") == m]
         if combine:
-            block = {"reference_month": m, "aggregation": "count-sum", "combined": _combine_directions(m_recs)}
+            entries = _combine_directions(m_recs)
+            block = {"reference_month": m, "aggregation": "count-sum", "combined": entries,
+                     "answer": _answer(entries, "route pair %s, both directions combined by count-sum" % want)}
         else:
-            block = {"reference_month": m, "aggregation": "none-per-direction", "directions": _per_direction(m_recs)}
+            dirs = _per_direction(m_recs)
+            # One answer per direction: each direction measures arrival at its own
+            # destination, so a single winner across both would conflate two operations.
+            block = {"reference_month": m, "aggregation": "none-per-direction", "directions": dirs,
+                     "answers": {label: _answer(entries, "direction %s" % label)
+                                 for label, entries in dirs.items()}}
         result_months.append(block)
 
     warnings = []
@@ -197,6 +204,81 @@ def build_comparison(records, meta, route_pair=DEFAULT_ROUTE, month=None, combin
         "months": result_months,
         "warnings": warnings,
     }
+
+
+ANCHOR_QUESTION = "On this route, which airline is most reliable? (by C2 punctuality)"
+
+
+def _answer_ref(entry):
+    """Compact reference to one airline in an answer block."""
+    return {
+        "airline_icao": entry.get("airline_icao"),
+        "airline_name": entry.get("airline_name"),
+        "on_time_rate": entry.get("on_time_rate"),
+        "flights_operated": entry.get("flights_operated"),
+    }
+
+
+def _answer(entries, scope):
+    """State the anchor answer for one already-ranked list of airlines.
+
+    Derived purely by ordering the C2-provided on_time_rate - no metric is applied.
+    Airlines whose rate is null (C2 denominator 0) are NOT ranked as most reliable:
+    absence of measurement is not a level of reliability. They are listed as excluded
+    so the omission is visible.
+    """
+    comparable = [e for e in entries if e.get("on_time_rate") is not None]
+    excluded = [e.get("airline_icao") for e in entries if e.get("on_time_rate") is None]
+
+    ans = {
+        "question": ANCHOR_QUESTION,
+        "scope": scope,
+        "airlines_compared": len(comparable),
+        "excluded_no_denominator": excluded,
+        "basis": ("ordering of the C2-provided on_time_rate, best to worst; "
+                  "no metric recomputed by the API (RT5)"),
+    }
+
+    if not comparable:
+        ans["most_reliable"] = None
+        ans["conclusive"] = False
+        ans["note"] = ("No airline has a punctuality rate in C2 for this scope "
+                       "(every denominator is 0) - the question cannot be answered.")
+        return ans
+
+    best = comparable[0]  # entries arrive sorted best-to-worst
+    top_rate = best["on_time_rate"]
+    # Exact equality of the C2 fraction: a tolerance would be a business rule, and
+    # business rules belong to Analytics, not here.
+    tied = [e for e in comparable if e["on_time_rate"] == top_rate]
+
+    if len(tied) > 1:
+        ans["most_reliable"] = None
+        ans["tie"] = [e.get("airline_icao") for e in tied]
+        ans["tied_at_on_time_rate"] = top_rate
+        ans["conclusive"] = False
+        ans["note"] = ("%d airlines share the top C2 on_time_rate exactly; C2 provides no "
+                       "tie-breaker, so the API declares no single winner."
+                       % len(tied))
+        return ans
+
+    ans["most_reliable"] = _answer_ref(best)
+    ans["tie"] = None
+    ans["conclusive"] = True
+
+    if len(comparable) >= 2:
+        runner_up = comparable[1]
+        ans["runner_up"] = _answer_ref(runner_up)
+        # Display delta between two C2 values - a subtraction for presentation, not a metric.
+        ans["rate_gap_vs_runner_up"] = top_rate - runner_up["on_time_rate"]
+    else:
+        ans["runner_up"] = None
+        ans["rate_gap_vs_runner_up"] = None
+        ans["conclusive"] = False
+        ans["note"] = ("Only one airline is comparable in this scope; AC3 asks for a comparison "
+                       "of at least 2 airlines, so this is not a comparison.")
+
+    return ans
 
 
 def _per_direction(m_recs):
@@ -283,11 +365,31 @@ def render_text(resp):
             for label, entries in block["directions"].items():
                 lines.append("  Direction %s (best -> worst):" % label)
                 lines += _render_rows(entries)
+                lines.append(_render_answer(block["answers"][label]))
         else:
-            lines.append("  Combined CGH<->SDU (count-sum aggregation, best -> worst):")
+            lines.append("  Combined %s (count-sum aggregation, best -> worst):" % q["route_pair"])
             lines += _render_rows(block["combined"])
+            lines.append(_render_answer(block["answer"]))
         lines.append("")
     return "\n".join(lines)
+
+
+def _render_answer(ans):
+    """One-line answer to the anchor question."""
+    if ans.get("tie"):
+        return "    => most reliable: TIE between %s at %s" % (
+            ", ".join(ans["tie"]), _fmt_rate(ans["tied_at_on_time_rate"]).strip())
+    best = ans.get("most_reliable")
+    if not best:
+        return "    => most reliable: UNANSWERABLE (%s)" % ans.get("note", "no comparable airline")
+    line = "    => most reliable: %s at %s" % (best["airline_icao"], _fmt_rate(best["on_time_rate"]).strip())
+    if ans.get("runner_up"):
+        line += " (+%.2f pp over %s)" % (ans["rate_gap_vs_runner_up"] * 100, ans["runner_up"]["airline_icao"])
+    if not ans.get("conclusive"):
+        line += "  [not conclusive: %s]" % ans.get("note", "")
+    if ans.get("excluded_no_denominator"):
+        line += "  [no data: %s]" % ", ".join(ans["excluded_no_denominator"])
+    return line
 
 
 def _render_rows(entries):
