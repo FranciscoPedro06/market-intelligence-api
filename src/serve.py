@@ -4,7 +4,8 @@
 SCOPE / RT5: This module contains NO metric calculation. The 15-minute rule, the
 denominator definition, the ICAO->IATA mapping and the on_time_rate itself are ALL
 resolved upstream in the C2 contract. Here we only:
-  - load C2,
+  - read C2,
+  - validate it against the frozen C2 v1.0.0 contract (see c2_validation.py),
   - filter by route pair (matched on the C2-provided IATA columns) and month,
   - group the two directional records that share a route_pair_id,
   - read the already-computed fields verbatim,
@@ -23,6 +24,8 @@ import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+import c2_validation
 
 DEFAULT_INPUT = "input/c2_punctuality.json"
 DEFAULT_ROUTE = "CGH-SDU"
@@ -61,6 +64,35 @@ def load_c2(path):
     else:
         raise ValueError("C2 document must be an object with 'records' or a JSON array")
     return records, meta
+
+
+def load_and_validate(path):
+    """Read C2, then gate it against the frozen contract.
+
+    Returns (servable_records, meta, validation_report). Records failing a
+    record-level gate are quarantined by the validator: excluded from what we serve
+    but enumerated in the report, so an exclusion is always visible and never silent.
+    A document-level failure yields zero servable records with status 'refused'.
+    """
+    raw, meta = load_c2(path)
+    report, servable = c2_validation.validate(raw, meta)
+    return servable, meta, report
+
+
+def _validation_summary(report):
+    """The compact validation block embedded in every served response."""
+    if report is None:
+        return None
+    return {
+        "status": report["status"],
+        "c2_declared_version": report["declared_version"],
+        "records_total": report["records_total"],
+        "records_valid": report["records_valid"],
+        "records_quarantined": report["records_quarantined"],
+        "error_count": report["error_count"],
+        "warning_count": report["warning_count"],
+        "detail": "GET /validation (HTTP) or --validate (CLI) for the full report",
+    }
 
 
 def _pair_key(a, b):
@@ -112,11 +144,13 @@ def _provenance(records, meta):
     return prov
 
 
-def build_comparison(records, meta, route_pair=DEFAULT_ROUTE, month=None, combine=False):
+def build_comparison(records, meta, route_pair=DEFAULT_ROUTE, month=None, combine=False,
+                     validation=None):
     """Build the airline reliability comparison for a route pair.
 
     route_pair: 'CGH-SDU' (IATA, order-independent). Matched against C2 IATA columns.
     month: optional 'YYYY-MM' filter.
+    validation: report from c2_validation.validate(), summarised into the response.
     combine: if True, sum the two directions' COUNTS per airline and re-express the
              ratio from those C2 counts. This is a pure aggregation of C2-provided
              integers (sum numerators / sum denominators), explicitly NOT a re-run of
@@ -146,12 +180,19 @@ def build_comparison(records, meta, route_pair=DEFAULT_ROUTE, month=None, combin
         warnings.append("SYNTHETIC C2 INPUT - illustrative numbers, not real ANAC/VRA data.")
     if not matched:
         warnings.append("No C2 records matched route_pair=%s month=%s." % (route_pair, month))
+    if validation and validation.get("records_quarantined"):
+        warnings.append("%d C2 record(s) quarantined by contract validation and excluded from this "
+                        "comparison - see the validation report."
+                        % validation["records_quarantined"])
+    if validation and validation.get("refused"):
+        warnings.append("C2 document REFUSED by contract validation - nothing is served.")
 
     return {
         "response_contract": "C3-draft",
         "response_version": C3_RESPONSE_VERSION,
         "query": {"route_pair": want, "route_pair_requested": route_pair,
                   "month": month, "combine_directions": combine},
+        "validation": _validation_summary(validation),
         "provenance": _provenance(matched, meta),
         "months": result_months,
         "warnings": warnings,
@@ -227,6 +268,11 @@ def render_text(resp):
     lines.append("Metric: %s %s | basis=%s threshold=%s min | C2=%s"
                  % (prov.get("metric_id"), prov.get("metric_version"), prov.get("on_time_basis"),
                     prov.get("on_time_threshold_minutes"), prov.get("c2_contract_version")))
+    v = resp.get("validation")
+    if v:
+        lines.append("C2 validation: %s (%d valid, %d quarantined, %d error, %d warning)"
+                     % (v["status"], v["records_valid"], v["records_quarantined"],
+                        v["error_count"], v["warning_count"]))
     for w in resp["warnings"]:
         lines.append("! " + w)
     lines.append("")
@@ -259,7 +305,7 @@ def _render_rows(entries):
 # ---------------------------------------------------------------------------
 # HTTP mode (stdlib http.server, read-only, GET only)
 # ---------------------------------------------------------------------------
-def make_handler(records, meta):
+def make_handler(records, meta, report=None):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, payload):
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -273,14 +319,20 @@ def make_handler(records, meta):
             parsed = urlparse(self.path)
             parts = [p for p in parsed.path.split("/") if p]
             if parsed.path == "/health":
-                return self._send(200, {"status": "ok", "records_loaded": len(records)})
+                return self._send(200, {"status": "ok", "records_loaded": len(records),
+                                        "c2_validation": (report or {}).get("status")})
+            if parsed.path == "/validation":
+                if report is None:
+                    return self._send(503, {"error": "no validation report available"})
+                return self._send(200, report)
             # /routes/{PAIR}/punctuality
             if len(parts) == 3 and parts[0] == "routes" and parts[2] == "punctuality":
                 qs = parse_qs(parsed.query)
                 month = qs.get("month", [None])[0]
                 combine = qs.get("combine", ["false"])[0].lower() in ("1", "true", "yes")
                 try:
-                    resp = build_comparison(records, meta, route_pair=parts[1], month=month, combine=combine)
+                    resp = build_comparison(records, meta, route_pair=parts[1], month=month,
+                                            combine=combine, validation=report)
                 except Exception as exc:  # noqa: BLE001
                     return self._send(400, {"error": str(exc)})
                 return self._send(200, resp)
@@ -296,8 +348,8 @@ def make_handler(records, meta):
     return Handler
 
 
-def serve_http(records, meta, port):
-    handler = make_handler(records, meta)
+def serve_http(records, meta, port, report=None):
+    handler = make_handler(records, meta, report)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
     print("Serving C2 read-only on http://127.0.0.1:%d" % port)
     print("  GET /routes/CGH-SDU/punctuality?month=2023-06&combine=true")
@@ -316,21 +368,42 @@ def main(argv=None):
     p.add_argument("--combine", action="store_true",
                    help="sum the two directions' C2 counts (documented pure aggregation)")
     p.add_argument("--json", action="store_true", help="emit raw JSON response instead of a table")
+    p.add_argument("--validate", action="store_true",
+                   help="print the full C2 contract validation report and exit")
+    p.add_argument("--strict", action="store_true",
+                   help="exit non-zero if C2 validation reports any error")
     p.add_argument("--http", action="store_true", help="run HTTP server instead of CLI")
     p.add_argument("--port", type=int, default=8000, help="HTTP port (default 8000)")
     args = p.parse_args(argv)
 
     try:
-        records, meta = load_c2(args.input)
+        records, meta, report = load_and_validate(args.input)
     except FileNotFoundError:
         print("ERROR: C2 input not found: %s" % args.input, file=sys.stderr)
         return 2
+    except ValueError as exc:
+        print("ERROR: invalid C2 input: %s" % exc, file=sys.stderr)
+        return 2
+
+    if args.validate:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1 if (args.strict and report["error_count"]) else 0
+
+    if report["refused"]:
+        print("ERROR: C2 document refused by contract validation (%d error(s)). Run --validate."
+              % report["error_count"], file=sys.stderr)
+        return 3
+    if args.strict and report["error_count"]:
+        print("ERROR: --strict and C2 validation reported %d error(s). Run --validate."
+              % report["error_count"], file=sys.stderr)
+        return 3
 
     if args.http:
-        serve_http(records, meta, args.port)
+        serve_http(records, meta, args.port, report)
         return 0
 
-    resp = build_comparison(records, meta, route_pair=args.route, month=args.month, combine=args.combine)
+    resp = build_comparison(records, meta, route_pair=args.route, month=args.month,
+                            combine=args.combine, validation=report)
     if args.json:
         print(json.dumps(resp, ensure_ascii=False, indent=2))
     else:
