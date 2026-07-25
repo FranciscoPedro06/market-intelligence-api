@@ -67,6 +67,23 @@ def make_record(airline="TAM", operated=100, on_time=80, month="2023-06",
 
 TEST_META = {"contract": "C2", "contract_version": "v1.0.0"}
 
+# The Analytics product's real C2 v1.1.0 output, if this checkout sits beside it.
+ANALYTICS_C2 = os.path.join(ROOT, os.pardir, "market-intelligence-analytics", "output", "c2_on_time.csv")
+
+
+def make_v110_record(missing_schedule=0, **override):
+    """A C2 v1.1.0 record: adds the new counter and folds it into flights_source_total."""
+    rec = make_record(**override)
+    rec["metric_version"] = "v1.1.0"
+    rec["flights_operated_missing_schedule"] = missing_schedule
+    rec["flights_source_total"] = (rec["flights_operated"] + missing_schedule
+                                   + rec["flights_cancelled"] + rec["flights_not_reported"]
+                                   + rec["flights_operated_missing_arrival"])
+    return rec
+
+
+V110_META = {"contract": "C2", "contract_version": "v1.1.0"}
+
 
 # ---------------------------------------------------------------------------
 # 1. RT5: the API serves C2's number, it does not make one
@@ -90,7 +107,7 @@ class TestServedNumberIsC2Number(unittest.TestCase):
                     for f in ("flights_operated", "flights_on_time"):
                         self.assertEqual(e[f], src[f])
                     for f in c2_validation.COUNT_FIELDS:
-                        if f in e["transparency"]:
+                        if f in e["transparency"] and f in src:
                             self.assertEqual(e["transparency"][f], src[f])
                     checked += 1
         self.assertEqual(checked, 12, "expected all 12 fixture records to be served")
@@ -104,10 +121,13 @@ class TestServedNumberIsC2Number(unittest.TestCase):
         self.assertEqual(azu[0]["flights_operated"], 0)
 
     def test_transparency_counters_are_served_verbatim(self):
+        """The fixture is v1.0.0, so the v1.1.0 counter is served as null, never 0:
+        0 would assert 'no flight lacked a schedule', which this C2 version never said."""
         resp = serve.build_comparison(self.records, self.meta, "CGH-SDU", month="2023-06")
         tam = [e for e in resp["months"][0]["directions"]["CGH->SDU"] if e["airline_icao"] == "TAM"][0]
         self.assertEqual(tam["transparency"], {"flights_cancelled": 6, "flights_not_reported": 2,
                                                "flights_operated_missing_arrival": 4,
+                                               "flights_operated_missing_schedule": None,
                                                "flights_source_total": 312})
 
 
@@ -259,7 +279,7 @@ class TestOrdering(unittest.TestCase):
             self.assertEqual(agg["flights_operated"], sum(r["flights_operated"] for r in src))
             self.assertEqual(agg["flights_on_time"], sum(r["flights_on_time"] for r in src))
             for f in c2_validation.COUNT_FIELDS:
-                if f in agg["transparency"]:
+                if f in agg["transparency"] and all(f in r for r in src):
                     self.assertEqual(agg["transparency"][f], sum(r[f] for r in src))
             # The combined ratio must come from the summed C2 counts, nothing else.
             self.assertEqual(agg["on_time_rate"], agg["flights_on_time"] / agg["flights_operated"])
@@ -523,6 +543,152 @@ class TestHttp(unittest.TestCase):
     def test_synthetic_input_is_flagged_in_every_response(self):
         _, body = self.get("/routes/CGH-SDU/punctuality")
         self.assertTrue(any("SYNTHETIC" in w for w in body["warnings"]))
+
+
+# ---------------------------------------------------------------------------
+# 8. C2 v1.1.0 alignment
+# ---------------------------------------------------------------------------
+class TestC2v110(unittest.TestCase):
+    """v1.1.0 is additive: a new transparency counter, folded into source_total.
+    The API must expose it verbatim and still serve v1.0.0 documents."""
+
+    def test_both_versions_are_supported(self):
+        self.assertEqual(c2_validation.SUPPORTED_C2_VERSIONS, ("v1.0.0", "v1.1.0"))
+
+    def test_v110_document_passes_clean(self):
+        recs = [make_v110_record(missing_schedule=3, airline="TAM"),
+                make_v110_record(missing_schedule=0, airline="GLO", operated=50, on_time=40)]
+        report, servable = c2_validation.validate(recs, V110_META)
+        self.assertEqual(report["status"], "pass", report["errors"] + report["warnings"])
+        self.assertEqual(len(servable), 2)
+
+    def test_new_counter_is_served_verbatim(self):
+        recs = [make_v110_record(missing_schedule=7, airline="TAM")]
+        resp = serve.build_comparison(recs, V110_META, "CGH-SDU")
+        entry = resp["months"][0]["directions"]["CGH->SDU"][0]
+        self.assertEqual(entry["transparency"]["flights_operated_missing_schedule"], 7)
+        self.assertIs(entry["on_time_rate"], recs[0]["on_time_rate"],
+                      "the rate must still be C2's own object, not recomputed")
+
+    def test_source_total_gate_includes_the_new_bucket(self):
+        """R7 must count missing_schedule; otherwise a v1.1.0 sum looks broken."""
+        good = make_v110_record(missing_schedule=5)
+        report, servable = c2_validation.validate([good], V110_META)
+        self.assertEqual(report["error_count"], 0, "a correct v1.1.0 sum must not trip R7")
+
+        bad = make_v110_record(missing_schedule=5)
+        bad["flights_source_total"] -= 5  # as if the new bucket were left out
+        report, servable = c2_validation.validate([bad], V110_META)
+        self.assertIn("R7_SOURCE_TOTAL", {f["code"] for f in report["errors"]})
+        self.assertEqual(servable, [])
+
+    def test_v100_document_still_serves(self):
+        """Backward compatibility: the older document has no such counter and is fine."""
+        records, meta = load_fixture()
+        report, servable = c2_validation.validate(records, meta)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(len(servable), 12)
+
+    def test_absent_counter_is_null_not_zero(self):
+        """0 would assert 'no flight lacked a schedule'; the v1.0.0 C2 never said that."""
+        records, meta = load_fixture()
+        resp = serve.build_comparison(records, meta, "CGH-SDU", month="2023-06")
+        for entries in resp["months"][0]["directions"].values():
+            for e in entries:
+                self.assertIsNone(e["transparency"]["flights_operated_missing_schedule"])
+        combined = serve.build_comparison(records, meta, "CGH-SDU", month="2023-06", combine=True)
+        for e in combined["months"][0]["combined"]:
+            self.assertIsNone(e["transparency"]["flights_operated_missing_schedule"],
+                              "combining absent counters must not manufacture a 0")
+
+    def test_v110_counter_is_summed_when_combining(self):
+        recs = [make_v110_record(missing_schedule=3, airline="TAM"),
+                make_v110_record(missing_schedule=4, airline="TAM",
+                                 origin_icao="SBRJ", origin_iata="SDU",
+                                 dest_icao="SBSP", dest_iata="CGH")]
+        resp = serve.build_comparison(recs, V110_META, "CGH-SDU", combine=True)
+        agg = resp["months"][0]["combined"][0]
+        self.assertEqual(agg["transparency"]["flights_operated_missing_schedule"], 7)
+
+    def test_v110_metric_without_the_counter_warns_but_serves(self):
+        rec = make_v110_record(missing_schedule=0)
+        del rec["flights_operated_missing_schedule"]
+        report, servable = c2_validation.validate([rec], V110_META)
+        self.assertIn("P5_MISSING_V110_COUNTER", {f["code"] for f in report["warnings"]})
+        self.assertEqual(report["error_count"], 0)
+        self.assertEqual(len(servable), 1, "a warning must not withhold the record")
+
+    def test_unmeasurable_flights_yield_a_null_rate_outside_the_denominator(self):
+        """The v1.1.0 shape the ACN case exhibits: flights exist, punctuality does not."""
+        rec = make_v110_record(missing_schedule=3, operated=0, on_time=0)
+        report, servable = c2_validation.validate([rec], V110_META)
+        self.assertEqual(report["error_count"], 0)
+        resp = serve.build_comparison(servable, V110_META, "CGH-SDU")
+        entry = resp["months"][0]["directions"]["CGH->SDU"][0]
+        self.assertIsNone(entry["on_time_rate"])
+        self.assertEqual(entry["flights_operated"], 0, "unmeasurable flights stay out of the denominator")
+        self.assertEqual(entry["transparency"]["flights_operated_missing_schedule"], 3)
+        self.assertEqual(entry["transparency"]["flights_source_total"], 3, "no C1 row vanishes")
+        ans = resp["months"][0]["answers"]["CGH->SDU"]
+        self.assertIsNone(ans["most_reliable"])
+        self.assertIn("TAM", ans["excluded_no_denominator"])
+
+
+@unittest.skipUnless(os.path.exists(ANALYTICS_C2),
+                     "real Analytics C2 output not present at %s" % ANALYTICS_C2)
+class TestAgainstRealAnalyticsOutput(unittest.TestCase):
+    """Runs against the Analytics product's actual C2 v1.1.0 output when available."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.records, cls.meta, cls.report = serve.load_and_validate(ANALYTICS_C2)
+
+    def test_real_output_has_no_contract_errors(self):
+        self.assertEqual(self.report["error_count"], 0,
+                         "real C2 failed validation: %s" % self.report["errors"])
+        self.assertEqual(self.report["records_quarantined"], 0)
+        self.assertGreater(self.report["records_valid"], 0)
+
+    def test_real_output_declares_metric_v110(self):
+        self.assertEqual({r["metric_version"] for r in self.records}, {"v1.1.0"})
+        for r in self.records:
+            self.assertIn("flights_operated_missing_schedule", r)
+
+    def test_acn_is_served_with_null_rate_and_missing_schedule(self):
+        """The reported acceptance check: ACN has unmeasurable flights, so no rate."""
+        months = sorted({r["reference_month"] for r in self.records
+                         if r["airline_icao"] == "ACN"})
+        self.assertTrue(months, "expected ACN in the real C2 output")
+        checked = 0
+        for month in months:
+            resp = serve.build_comparison(self.records, self.meta, "CGH-SDU",
+                                          month=month, validation=self.report)
+            for label, entries in resp["months"][0]["directions"].items():
+                for e in entries:
+                    if e["airline_icao"] != "ACN":
+                        continue
+                    self.assertIsNone(e["on_time_rate"], "ACN %s %s" % (month, label))
+                    self.assertGreater(e["transparency"]["flights_operated_missing_schedule"], 0,
+                                       "ACN %s %s" % (month, label))
+                    checked += 1
+        self.assertEqual(checked, 6, "expected 6 served ACN records (3 months x 2 directions)")
+
+    def test_acn_is_excluded_from_the_answer_not_ranked(self):
+        resp = serve.build_comparison(self.records, self.meta, "CGH-SDU",
+                                      month="2023-04", validation=self.report)
+        for ans in resp["months"][0]["answers"].values():
+            self.assertIn("ACN", ans["excluded_no_denominator"])
+            self.assertNotEqual((ans["most_reliable"] or {}).get("airline_icao"), "ACN")
+
+    def test_real_output_reconciles(self):
+        """Every served record's source_total closes over the five v1.1.0 buckets."""
+        for r in self.records:
+            self.assertEqual(
+                r["flights_source_total"],
+                r["flights_operated"] + r["flights_operated_missing_arrival"]
+                + r["flights_operated_missing_schedule"] + r["flights_cancelled"]
+                + r["flights_not_reported"],
+                "reconciliation failed for %s" % c2_validation.record_key(r))
 
 
 if __name__ == "__main__":

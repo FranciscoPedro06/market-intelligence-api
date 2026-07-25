@@ -23,7 +23,12 @@ Reference: docs/ecosystem/contracts.md -> "C2 - Analytics -> API - v1.0.0".
 import re
 
 CONTRACT_NAME = "C2"
-SUPPORTED_C2_VERSIONS = ("v1.0.0",)
+# v1.1.0 is an additive amendment: no field removed or renamed, so both are servable.
+SUPPORTED_C2_VERSIONS = ("v1.0.0", "v1.1.0")
+
+# Counters introduced by a later C2 version. Absent in an older document, which is not
+# an error - the bucket simply did not exist then.
+V1_1_0_COUNTERS = ("flights_operated_missing_schedule",)
 
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
@@ -68,6 +73,7 @@ COUNT_FIELDS = (
     "flights_cancelled",
     "flights_not_reported",
     "flights_operated_missing_arrival",
+    "flights_operated_missing_schedule",  # v1.1.0
     "flights_source_total",
 )
 
@@ -143,8 +149,9 @@ def validate_record(rec, index):
                             "missing required C2 field(s): %s" % ", ".join(missing), index, key))
         return out  # later gates would just cascade off the same cause
 
-    # R2 - types.
-    for f in COUNT_FIELDS:
+    # R2 - types. Only fields the document actually carries: a counter added in a later
+    # C2 version is legitimately absent from an older document.
+    for f in [f for f in COUNT_FIELDS if f in rec]:
         if not _is_int(rec[f]):
             out.append(_finding("R2_TYPE", "error",
                                 "%s=%r is %s, expected integer" % (f, rec[f], type(rec[f]).__name__),
@@ -161,7 +168,7 @@ def validate_record(rec, index):
     rate = rec["on_time_rate"]
 
     # R3 - count sanity.
-    for f in COUNT_FIELDS:
+    for f in [f for f in COUNT_FIELDS if f in rec]:
         if rec[f] < 0:
             out.append(_finding("R3_NEGATIVE_COUNT", "error", "%s=%d is negative" % (f, rec[f]), index, key))
     if on_time > operated:
@@ -192,12 +199,27 @@ def validate_record(rec, index):
                                 % (rate, expected), index, key))
 
     # R7 - transparency reconciliation (contracts.md AC4): no C1 row may vanish.
-    parts = (operated + rec["flights_operated_missing_arrival"]
-             + rec["flights_cancelled"] + rec["flights_not_reported"])
+    # v1.1.0 added missing_schedule to the sum; absent (v1.0.0) it contributes 0, so one
+    # formula serves both versions.
+    buckets = ("flights_operated_missing_arrival", "flights_operated_missing_schedule",
+               "flights_cancelled", "flights_not_reported")
+    parts = operated + sum(rec.get(f) or 0 for f in buckets)
     if rec["flights_source_total"] != parts:
         out.append(_finding("R7_SOURCE_TOTAL", "error",
-                            "flights_source_total=%d != operated+missing_arrival+cancelled+not_reported=%d"
-                            % (rec["flights_source_total"], parts), index, key))
+                            "flights_source_total=%d != operated+%s=%d"
+                            % (rec["flights_source_total"],
+                               "+".join(f.replace("flights_", "") for f in buckets), parts),
+                            index, key))
+
+    # P5 - a v1.1.0 metric must carry the v1.1.0 counters. Warning, not error: the
+    # served rate is still C2's, and R7 above independently catches a sum that no
+    # longer closes. Absent counters default to 0 per the contract, never invented.
+    if rec.get("metric_version") == "v1.1.0":
+        absent = [f for f in V1_1_0_COUNTERS if f not in rec]
+        if absent:
+            out.append(_finding("P5_MISSING_V110_COUNTER", "warning",
+                                "metric_version=v1.1.0 but counter(s) absent: %s" % ", ".join(absent),
+                                index, key))
 
     # R8 - route keys must agree with the ICAO columns they are built from.
     expected_route = "%s-%s" % (rec["origin_icao"], rec["dest_icao"])

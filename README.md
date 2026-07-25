@@ -16,18 +16,33 @@ mais confiável?"*. **Não contém regra de cálculo (RT5).**
 
 ## Contrato: C2 entra → resposta (C3-draft) sai
 
-**Entrada — C2 `v1.0.0`** (`docs/ecosystem/contracts.md`). Grão: rota **direcional**
-(origem→destino) × companhia × mês, com `route_pair_id` não-direcional. A API lê
-**verbatim**: `on_time_rate`, `flights_operated`, `flights_on_time`, contadores de
+**Entrada — C2 `v1.1.0`** (`docs/ecosystem/contracts.md`; `v1.0.0` continua aceito —
+a emenda é aditiva, nenhum campo foi removido ou renomeado). Grão: rota **direcional**
+(origem→destino) × companhia × mês, com `route_pair_id` não-direcional.
+
+**A API serve os números verbatim.** Ela não calcula, não deriva e não corrige nada:
+`on_time_rate`, `flights_operated`, `flights_on_time`, os **5** contadores de
 transparência (`flights_cancelled`, `flights_not_reported`,
-`flights_operated_missing_arrival`, `flights_source_total`) e a linhagem/proveniência.
+`flights_operated_missing_arrival`, `flights_operated_missing_schedule`,
+`flights_source_total`) e a linhagem/proveniência saem exatamente como o C2 os
+escreveu — garantido por teste com `assertIs`, não por comparação aproximada.
+
+> **Voos não mensuráveis podem aparecer com `on_time_rate = null`.** No C2 `v1.1.0` o
+> denominador exige `scheduled_arrival`: um voo `REALIZADO` com chegada real mas **sem
+> chegada prevista** tem pontualidade **indefinida**, fica **fora do denominador** e é
+> contado em `flights_operated_missing_schedule` — **nunca** como atrasado. Quando
+> todos os voos de uma companhia caem nesse caso, o denominador é 0 e o C2 emite
+> `on_time_rate = null`. A API **repassa esse null**: não o converte em 0 (que
+> afirmaria 0% de pontualidade), não ranqueia a companhia e a lista em
+> `excluded_no_denominator`. Os voos continuam visíveis nos contadores, e
+> `flights_source_total` prova que nenhuma linha do C1 desapareceu.
 
 **Saída — C3-draft (Fase 1).** Comparação por rota, por mês, ordenada melhor→pior:
 
 | Campo servido | Origem |
 |---|---|
 | `on_time_rate`, `flights_operated`, `flights_on_time` | **lido verbatim do C2** |
-| `transparency.*` (4 contadores) | **lido verbatim do C2** |
+| `transparency.*` (5 contadores, incl. `flights_operated_missing_schedule`) | **lido verbatim do C2** |
 | `provenance` (`metric_version`, `on_time_basis`, `on_time_threshold_minutes`, `source_lineage`, …) | **lido verbatim do C2** |
 | `rank`, ordenação melhor→pior | derivado (apenas ordenação — não é lógica de métrica) |
 | `answer` / `answers` (companhia mais confiável) | derivado (apenas a leitura da ordenação) |
@@ -68,7 +83,7 @@ servir. Os checks apenas **asseguram o contrato** — nenhum valor servido nasce
 
 | Código | Verifica |
 |---|---|
-| `D1_CONTRACT_NAME` / `D2_CONTRACT_VERSION` | é C2, e numa versão suportada (`v1.0.0`) |
+| `D1_CONTRACT_NAME` / `D2_CONTRACT_VERSION` | é C2, e numa versão suportada (`v1.0.0`, `v1.1.0`) |
 | `D3_GRAIN_DUPLICATE` | no máximo um registro por (`route_id`, `airline_icao`, `reference_month`) |
 | `D4_PROVENANCE_MIXED` | todos concordam em `metric_id`/`metric_version`/`on_time_basis`/`on_time_threshold_minutes` — ranquear números feitos por regras diferentes não significaria nada |
 
@@ -82,13 +97,21 @@ o registro é **listado no relatório**, nunca descartado em silêncio):
 | `R4_NULL_RULE` | `on_time_rate` é nulo **exatamente quando** o denominador é 0 (nunca 0/0) |
 | `R5_RATE_RANGE` | taxa em [0,1] (fração, não percentual) |
 | `R6_RATE_INCONSISTENT` | a taxa servida é a razão das contagens servidas |
-| `R7_SOURCE_TOTAL` | `flights_source_total` fecha a reconciliação (AC4) |
+| `R7_SOURCE_TOTAL` | `flights_source_total` fecha a reconciliação (AC4) sobre os 4 buckets fora do denominador — em `v1.1.0` inclui `flights_operated_missing_schedule`; ausente (`v1.0.0`) ele contribui 0, então uma só fórmula serve as duas versões |
 | `R8_ROUTE_KEY` / `R8_PAIR_KEY` / `R8_MISSING_IATA` | chaves de rota coerentes com as colunas ICAO; colunas IATA presentes |
 | `R9_MONTH_FORMAT` | `reference_month` em `YYYY-MM` |
 
 **Gates de rastreabilidade → avisam e continuam servindo** (`status: pass_with_warnings`):
-`P1_PROVENANCE`, `P2_LINEAGE`, `P3_AUDIT`, `P4_AIRLINE_NAME`, `R9_MONTH_LINEAGE`. O
+`P1_PROVENANCE`, `P2_LINEAGE`, `P3_AUDIT`, `P4_AIRLINE_NAME`, `R9_MONTH_LINEAGE` e
+`P5_MISSING_V110_COUNTER` (`metric_version = v1.1.0` sem os contadores da v1.1.0 — só
+aviso, porque o `R7` acima já pega, como erro, uma soma que deixou de fechar). O
 número continua sendo o do C2; só a trilha de auditoria está degradada.
+
+**Versões conviventes.** Um contador introduzido numa versão posterior é
+legitimamente **ausente** num documento antigo — isso não é erro. A API o serve como
+`null` (exibido `-` na tabela), nunca como `0`: zero afirmaria "nenhum voo nesse
+bucket", e o C2 `v1.0.0` nunca disse isso. O mesmo vale ao combinar direções — somar
+contadores ausentes não fabrica um `0`.
 
 > **RT5 no gate `R6`:** ele divide numerador por denominador *apenas para conferir* o
 > `on_time_rate` do C2 e descarta o resultado. O valor servido é sempre o que o C2
@@ -131,7 +154,14 @@ python src/serve.py --input input/sample_c2.json --route CGH-SDU --json      # r
 python src/serve.py --input input/sample_c2.json --validate                  # relatório de validação do C2
 python src/serve.py --input input/sample_c2.json --validate --strict         # sai != 0 se houver erro
 ```
-Default de `--input`: `input/c2_punctuality.json` (o C2 real, ainda não disponível na Fase 1).
+Default de `--input`: `input/c2_punctuality.json`. O C2 real produzido pelo Analytics
+fica em `../market-intelligence-analytics/output/c2_on_time.csv` (conteúdo JSON) —
+passe-o com `--input` ou copie-o para `input/c2_punctuality.json`:
+
+```bash
+python src/serve.py --input ../market-intelligence-analytics/output/c2_on_time.csv \
+    --route CGH-SDU --month 2023-06
+```
 
 **Códigos de saída da CLI:** `0` ok · `2` input inexistente/ilegível ou pedido
 malformado · `3` C2 recusado pela validação (ou `--strict` com erros) · `4` rota/mês
@@ -148,35 +178,48 @@ curl http://127.0.0.1:8000/validation
 
 **Self-test:**
 ```bash
-python tests/self_test.py        # 40 casos, stdlib unittest, sem dependências
+python tests/self_test.py        # 54 casos, stdlib unittest, sem dependências
 ```
 
-## Exemplo de saída (fixture sintética `input/sample_c2.json`)
+## Exemplo de saída (C2 `v1.1.0` real do Analytics)
 
 ```
-Route pair: CGH-SDU   month: 2023-07   mode: per-direction
-Metric: pontualidade v1.0.0 | basis=arrival threshold=15 min | C2=v1.0.0
-C2 validation: pass (12 valid, 0 quarantined, 0 error, 0 warning)
-! SYNTHETIC C2 INPUT - illustrative numbers, not real ANAC/VRA data.
+$ python src/serve.py --input ../market-intelligence-analytics/output/c2_on_time.csv \
+      --route CGH-SDU --month 2023-06
 
-=== 2023-07 ===
-  Direction CGH->SDU (best -> worst):
-    #  airline  on_time_rate   operated  on_time   canc  n/r  miss  src_total
-    1  GLO      85.88%        255      219      5    1     2        263
-    2  TAM      83.87%        310      260      8    2     6        326
-    3  AZU       n/a            0        0     12    3     0         15
-    => most reliable: GLO at 85.88% (+2.01 pp over TAM)  [no data: AZU]
+Route pair: CGH-SDU   month: 2023-06   mode: per-direction
+Metric: pontualidade v1.1.0 | basis=arrival threshold=15 min | C2=None
+C2 validation: pass_with_warnings (25 valid, 0 quarantined, 0 error, 2 warning)
+
+=== 2023-06 ===
   Direction SDU->CGH (best -> worst):
-    #  airline  on_time_rate   operated  on_time   canc  n/r  miss  src_total
-    1  GLO      84.68%        248      210      4    1     3        256
-    2  TAM      84.59%        305      258      6    2     4        317
-    3  AZU      71.00%        100       71      3    1     2        106
-    => most reliable: GLO at 84.68% (+0.09 pp over TAM)
+    #  airline  on_time_rate   operated  on_time   canc  n/r  no_arr  no_sch  src_total
+    1  TAM      86.75%        649      563     26    0      0      2        677
+    2  GLO      85.61%        528      452     38    0      0      0        566
+    3  AZU      83.04%        336      279      1    0      0      0        337
+    4  ACN       n/a            0        0      0    0      0      4          4
+    => most reliable: TAM at 86.75% (+1.14 pp over GLO)  [no data: ACN]
+  Direction CGH->SDU (best -> worst):
+    #  airline  on_time_rate   operated  on_time   canc  n/r  no_arr  no_sch  src_total
+    1  TAM      88.67%        653      579     22    0      0      0        675
+    2  AZU      87.42%        326      285     10    0      0      8        344
+    3  GLO      85.09%        530      451     36    0      0      0        566
+    4  ACN       n/a            0        0      0    0      0      4          4
+    => most reliable: TAM at 88.67% (+1.24 pp over AZU)  [no data: ACN]
 ```
-(Percentuais são só formatação de exibição; o JSON carrega o `on_time_rate` em
-precisão plena do C2 — arredondamento é responsabilidade do C3. `AZU` aparece com
-`n/a` porque o denominador do C2 é 0: os 15 voos existem como cancelados/não
-informados e continuam visíveis nos contadores de transparência.)
+
+`ACN` é exatamente o caso de **voo não mensurável**: os 4 voos existem e aparecem em
+`no_sch` (`flights_operated_missing_schedule`), fecham o `src_total`, mas ficam fora
+do denominador — então o C2 emite `on_time_rate = null`, a API exibe `n/a` e a
+companhia é excluída da resposta em vez de ranqueada como pior. `AZU` mostra o caso
+misto: 8 voos sem previsão de chegada, e ainda assim uma taxa válida sobre os 326
+mensuráveis.
+
+Percentuais são só formatação de exibição; o JSON carrega o `on_time_rate` em precisão
+plena do C2 — arredondamento é responsabilidade do C3. Coluna `-` significa contador
+não reportado por aquela versão do C2 (ver *Versões conviventes*). `C2=None` e os 2
+avisos vêm de o arquivo do Analytics ser um array JSON puro, sem envelope declarando
+`contract`/`contract_version`; os registros declaram `metric_version: v1.1.0`.
 
 ## Self-test / fixture
 `input/sample_c2.json` é **SINTÉTICO** (marcado com `_synthetic` e `_warning`),
@@ -184,10 +227,10 @@ conforme ao C2 `v1.0.0`: 3 companhias (TAM/GLO/AZU), 2 meses (2023-06/07), ambas
 direções, incluindo um caso `on_time_rate = null` (denominador 0) para exercitar a
 transparência. Commitado via force-add (o `.gitignore` ignora `input/`).
 
-`tests/self_test.py` (40 casos) verifica, em ordem de importância:
+`tests/self_test.py` (54 casos) verifica, em ordem de importância:
 
 1. **RT5 / AC4** — o `on_time_rate` servido **é** o objeto do C2 (`assertIs`, não
-   comparação aproximada) nos 12 registros; contagens e os 4 contadores de
+   comparação aproximada) nos 12 registros; contagens e os contadores de
    transparência copiados verbatim.
 2. **Cada gate de validação** dispara sob uma corrupção dirigida da fixture — um gate
    que nunca dispara não é um gate. Verifica também o raio de impacto: gate de
@@ -197,15 +240,33 @@ transparência. Commitado via force-add (o `.gitignore` ignora `input/`).
    entrada não muda o ranking.
 5. **Validação de pedido** e semântica de status HTTP (matriz de 18 casos); a saída
    HTTP é idêntica à chamada em processo para a mesma query.
+6. **Alinhamento C2 `v1.1.0`** — o novo contador servido verbatim, somado ao combinar
+   direções, incluído no gate `R7`; ausência em `v1.0.0` servida como `null` e não `0`;
+   e o caso de voo não mensurável (denominador 0 → `on_time_rate = null`, companhia
+   excluída da resposta).
+7. **Contra o C2 real do Analytics**, quando presente em
+   `../market-intelligence-analytics/output/c2_on_time.csv` (a classe é *skipped* se o
+   arquivo não existir, para o suite não depender de um repo vizinho): validação sem
+   erros, `metric_version = v1.1.0` em todos os registros, reconciliação dos 5 buckets
+   e o caso `ACN` (`on_time_rate = null` com `flights_operated_missing_schedule > 0`
+   nos 6 registros servidos).
 
 ## Estado
-Sprint 1 — Walking Skeleton, Fase 1. Camada de exposição funcional e validada sobre
-C2, com a pergunta-âncora respondida explicitamente.
+Sprint 1 — Walking Skeleton. Camada de exposição funcional e validada sobre C2
+`v1.1.0`, com a pergunta-âncora respondida explicitamente.
 Armazenamento/serialização/framework permanecem deferidos.
 
-**Pendente para a Fase 2/3** (depende de outros produtos, não desta camada): trocar a
-fixture sintética pelo C2 real do Analytics (AC1/AC2), reconciliação manual conjunta
-contra o VRA (AC4) e revisão cruzada entre os três engenheiros (DoD).
+Alinhada ao C2 `v1.1.0` em 2026-07-25 e verificada contra a saída real do Analytics
+(25 registros, 5 companhias, 2023-04..06, 0 erro de contrato).
+
+**Pendente para a Fase 3** (depende dos três engenheiros, não desta camada):
+reconciliação manual conjunta contra o VRA (AC4) e revisão cruzada (DoD).
+
+**Observação para o Analytics** (não bloqueante): a saída é um array JSON puro, sem
+envelope `{"contract": "C2", "contract_version": "v1.1.0", "records": [...]}`, então a
+API avisa que não pode confirmar a versão do contrato pelo documento — só pelo
+`metric_version` de cada registro. Além disso `output/c2_on_time.csv` tem conteúdo
+**JSON**, não CSV, apesar da extensão.
 
 Contratos e governança:
 https://github.com/FranciscoPedro06/Market-Intelligence-Ecosystem

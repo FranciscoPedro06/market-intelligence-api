@@ -39,6 +39,9 @@ _TRANSPARENCY_FIELDS = (
     "flights_cancelled",
     "flights_not_reported",
     "flights_operated_missing_arrival",
+    # v1.1.0: REALIZADO with a real arrival but no scheduled arrival, so punctuality is
+    # undefined. Outside the denominator; never counted as delayed. Served verbatim.
+    "flights_operated_missing_schedule",
     "flights_source_total",
 )
 _PROVENANCE_FIELDS = (
@@ -400,13 +403,17 @@ def _combine_directions(m_recs):
             "directions_included": [],
             "flights_operated": 0,
             "flights_on_time": 0,
-            "transparency": {f: 0 for f in _TRANSPARENCY_FIELDS},
+            # None, not 0: a counter absent from this C2 version is unknown, and 0 would
+            # assert that no such flight exists. It becomes a number only if C2 sent one.
+            "transparency": {f: None for f in _TRANSPARENCY_FIELDS},
         })
         agg["directions_included"].append(rec.get("route_id"))
         agg["flights_operated"] += rec.get("flights_operated") or 0
         agg["flights_on_time"] += rec.get("flights_on_time") or 0
         for f in _TRANSPARENCY_FIELDS:
-            agg["transparency"][f] += rec.get(f) or 0
+            if rec.get(f) is None:
+                continue
+            agg["transparency"][f] = (agg["transparency"][f] or 0) + rec[f]
 
     entries = []
     for agg in by_airline.values():
@@ -484,15 +491,22 @@ def _render_answer(ans):
     return line
 
 
+def _fmt_count(v):
+    """'-' for a counter this C2 version does not report; 0 would assert 'none exist'."""
+    return "-" if v is None else str(v)
+
+
 def _render_rows(entries):
-    out = ["    #  airline  on_time_rate   operated  on_time   canc  n/r  miss  src_total"]
+    out = ["    #  airline  on_time_rate   operated  on_time   canc  n/r  no_arr  no_sch  src_total"]
     for e in entries:
         t = e["transparency"]
-        out.append("    %-2d %-7s %s   %8s %8s   %4s %4s %5s %10s"
+        out.append("    %-2d %-7s %s   %8s %8s   %4s %4s %6s %6s %10s"
                     % (e["rank"], e["airline_icao"], _fmt_rate(e["on_time_rate"]),
                        e["flights_operated"], e["flights_on_time"],
-                       t["flights_cancelled"], t["flights_not_reported"],
-                       t["flights_operated_missing_arrival"], t["flights_source_total"]))
+                       _fmt_count(t["flights_cancelled"]), _fmt_count(t["flights_not_reported"]),
+                       _fmt_count(t["flights_operated_missing_arrival"]),
+                       _fmt_count(t["flights_operated_missing_schedule"]),
+                       _fmt_count(t["flights_source_total"])))
     return out
 
 
