@@ -95,10 +95,96 @@ def _validation_summary(report):
     }
 
 
+class BadRequest(ValueError):
+    """Caller sent something malformed -> 400. Never a silent empty result."""
+
+
+class NotFound(LookupError):
+    """Well-formed request for a route/month C2 does not contain -> 404."""
+
+    def __init__(self, message, **extra):
+        super().__init__(message)
+        self.extra = extra
+
+
 def _pair_key(a, b):
-    """Non-directional key from two IATA codes (order-independent). NOT a mapping;
-    just a canonical grouping over C2-provided IATA columns."""
+    """Non-directional key from two airport codes (order-independent). NOT a mapping;
+    just a canonical grouping over C2-provided columns."""
     return "-".join(sorted([a.upper(), b.upper()]))
+
+
+def parse_route_pair(raw):
+    """Validate a route-pair path segment. Returns (canonical_key, code_kind).
+
+    Accepts 'CGH-SDU' (both IATA) or 'SBSP-SBRJ' (both ICAO); C2 carries both column
+    families, so we filter on whichever the caller used rather than translating codes
+    (translation is the Analytics' job).
+    """
+    if not raw or not raw.strip():
+        raise BadRequest("route pair is empty; expected IATA-IATA (e.g. CGH-SDU) or ICAO-ICAO")
+    tokens = raw.strip().upper().split("-")
+    if len(tokens) != 2:
+        raise BadRequest("route pair %r must be exactly two codes joined by '-' (e.g. CGH-SDU)" % raw)
+    a, b = tokens
+    if not (a.isalpha() and b.isalpha()):
+        raise BadRequest("route pair %r must contain letters only (e.g. CGH-SDU)" % raw)
+    if len(a) == 3 and len(b) == 3:
+        kind = "iata"
+    elif len(a) == 4 and len(b) == 4:
+        kind = "icao"
+    else:
+        raise BadRequest("route pair %r must be two 3-letter IATA codes or two 4-letter ICAO codes,"
+                         " not a mix" % raw)
+    if a == b:
+        raise BadRequest("route pair %r has the same origin and destination" % raw)
+    return _pair_key(a, b), kind
+
+
+def parse_month(raw):
+    """Validate an optional YYYY-MM filter. None means 'all months'."""
+    if raw is None or raw == "":
+        return None
+    if not c2_validation.MONTH_RE.match(raw.strip()):
+        raise BadRequest("month %r must be YYYY-MM with a month in 01-12 (e.g. 2023-06)" % raw)
+    return raw.strip()
+
+
+def parse_bool(raw, name):
+    """Strict boolean: an unrecognised value is an error, not a silent False."""
+    if raw is None or raw == "":
+        return False
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes"):
+        return True
+    if v in ("0", "false", "no"):
+        return False
+    raise BadRequest("%s=%r is not a boolean (use true or false)" % (name, raw))
+
+
+def _record_pair_key(rec, kind):
+    """The record's non-directional key in the caller's code family, or None."""
+    o, d = (rec.get("origin_iata"), rec.get("dest_iata")) if kind == "iata" \
+        else (rec.get("origin_icao"), rec.get("dest_icao"))
+    return _pair_key(o, d) if o and d else None
+
+
+def route_index(records, kind="iata"):
+    """Coverage index: what this C2 document actually lets us answer. Pure read."""
+    idx = {}
+    for rec in records:
+        key = _record_pair_key(rec, kind)
+        if not key:
+            continue
+        e = idx.setdefault(key, {"route_pair": key, "code_kind": kind, "directions": set(),
+                                 "months": set(), "airlines": set(), "records": 0})
+        e["directions"].add("%s->%s" % (rec.get("origin_iata"), rec.get("dest_iata")))
+        e["months"].add(rec.get("reference_month"))
+        e["airlines"].add(rec.get("airline_icao"))
+        e["records"] += 1
+    return [{"route_pair": e["route_pair"], "code_kind": e["code_kind"],
+             "directions": sorted(e["directions"]), "months": sorted(e["months"]),
+             "airlines": sorted(e["airlines"]), "records": e["records"]}
+            for e in sorted(idx.values(), key=lambda x: x["route_pair"])]
 
 
 def _rate_sort_key(entry):
@@ -156,14 +242,24 @@ def build_comparison(records, meta, route_pair=DEFAULT_ROUTE, month=None, combin
              integers (sum numerators / sum denominators), explicitly NOT a re-run of
              the metric definition (the 15-min rule, denominator scope, etc. stay in C2).
              Default False => per-direction presentation, zero aggregation.
-    """
-    want = _pair_key(*route_pair.split("-"))
 
-    matched = []
-    for rec in records:
-        oi, di = rec.get("origin_iata"), rec.get("dest_iata")
-        if oi and di and _pair_key(oi, di) == want and (month is None or rec.get("reference_month") == month):
-            matched.append(rec)
+    Raises BadRequest on a malformed route/month, NotFound when the request is
+    well-formed but this C2 document has no such route pair or month.
+    """
+    want, kind = parse_route_pair(route_pair)
+    month = parse_month(month)
+
+    on_pair = [rec for rec in records if _record_pair_key(rec, kind) == want]
+    if not on_pair:
+        raise NotFound("no C2 records for route pair %s" % want,
+                       route_pair=want,
+                       available_route_pairs=[r["route_pair"] for r in route_index(records, kind)])
+
+    matched = [rec for rec in on_pair if month is None or rec.get("reference_month") == month]
+    if not matched:
+        raise NotFound("route pair %s has no C2 records for month %s" % (want, month),
+                       route_pair=want, month=month,
+                       available_months=sorted({r.get("reference_month") for r in on_pair}))
 
     months = sorted({rec.get("reference_month") for rec in matched})
     result_months = []
@@ -185,19 +281,15 @@ def build_comparison(records, meta, route_pair=DEFAULT_ROUTE, month=None, combin
     warnings = []
     if meta.get("_synthetic"):
         warnings.append("SYNTHETIC C2 INPUT - illustrative numbers, not real ANAC/VRA data.")
-    if not matched:
-        warnings.append("No C2 records matched route_pair=%s month=%s." % (route_pair, month))
     if validation and validation.get("records_quarantined"):
         warnings.append("%d C2 record(s) quarantined by contract validation and excluded from this "
                         "comparison - see the validation report."
                         % validation["records_quarantined"])
-    if validation and validation.get("refused"):
-        warnings.append("C2 document REFUSED by contract validation - nothing is served.")
 
     return {
         "response_contract": "C3-draft",
         "response_version": C3_RESPONSE_VERSION,
-        "query": {"route_pair": want, "route_pair_requested": route_pair,
+        "query": {"route_pair": want, "route_pair_requested": route_pair, "code_kind": kind,
                   "month": month, "combine_directions": combine},
         "validation": _validation_summary(validation),
         "provenance": _provenance(matched, meta),
@@ -407,42 +499,149 @@ def _render_rows(entries):
 # ---------------------------------------------------------------------------
 # HTTP mode (stdlib http.server, read-only, GET only)
 # ---------------------------------------------------------------------------
+ENDPOINTS = [
+    {"method": "GET", "path": "/", "returns": "this endpoint index"},
+    {"method": "GET", "path": "/health", "returns": "liveness + records loaded + C2 validation status"},
+    {"method": "GET", "path": "/meta", "returns": "contract versions, metric provenance, coverage"},
+    {"method": "GET", "path": "/validation", "returns": "full C2 v1.0.0 contract validation report"},
+    {"method": "GET", "path": "/routes", "returns": "route pairs available in this C2 document"},
+    {"method": "GET", "path": "/routes/{PAIR}/airlines", "returns": "airlines present on the pair"},
+    {"method": "GET", "path": "/routes/{PAIR}/punctuality?month=YYYY-MM&combine=true",
+     "returns": "airline punctuality comparison, best to worst, with the anchor answer"},
+    {"method": "GET", "path": "/routes/{PAIR}/most-reliable?month=YYYY-MM&combine=true",
+     "returns": "the anchor answer alone: which airline is most reliable"},
+]
+
+
+def build_meta(records, meta, report=None):
+    """Served contract metadata: what this instance is exposing and from what."""
+    prov = _provenance(records, meta)
+    return {
+        "service": "market-intelligence-api",
+        "role": "read-only exposure layer over C2; contains no metric calculation (RT5)",
+        "input_contract": {"name": c2_validation.CONTRACT_NAME,
+                           "declared_version": meta.get("contract_version"),
+                           "supported_versions": list(c2_validation.SUPPORTED_C2_VERSIONS)},
+        "output_contract": {"name": "C3-draft", "version": C3_RESPONSE_VERSION},
+        "metric_provenance": {k: prov.get(k) for k in _PROVENANCE_FIELDS},
+        "records_servable": len(records),
+        "validation": _validation_summary(report),
+        "coverage": route_index(records, "iata"),
+        "endpoints": ENDPOINTS,
+        "synthetic_input": bool(meta.get("_synthetic")),
+    }
+
+
+def build_airlines(records, meta, route_pair, month=None):
+    """Airlines C2 covers on a pair. Pure filter - no measures, no ranking."""
+    want, kind = parse_route_pair(route_pair)
+    month = parse_month(month)
+    on_pair = [r for r in records if _record_pair_key(r, kind) == want]
+    if not on_pair:
+        raise NotFound("no C2 records for route pair %s" % want, route_pair=want,
+                       available_route_pairs=[r["route_pair"] for r in route_index(records, kind)])
+    scoped = [r for r in on_pair if month is None or r.get("reference_month") == month]
+    if not scoped:
+        raise NotFound("route pair %s has no C2 records for month %s" % (want, month),
+                       route_pair=want, month=month,
+                       available_months=sorted({r.get("reference_month") for r in on_pair}))
+    airlines = {}
+    for rec in scoped:
+        a = airlines.setdefault(rec.get("airline_icao"),
+                                {"airline_icao": rec.get("airline_icao"),
+                                 "airline_name": rec.get("airline_name"),
+                                 "months": set(), "directions": set()})
+        a["months"].add(rec.get("reference_month"))
+        a["directions"].add("%s->%s" % (rec.get("origin_iata"), rec.get("dest_iata")))
+    return {
+        "query": {"route_pair": want, "code_kind": kind, "month": month},
+        "airlines": [{"airline_icao": a["airline_icao"], "airline_name": a["airline_name"],
+                      "months": sorted(a["months"]), "directions": sorted(a["directions"])}
+                     for a in sorted(airlines.values(), key=lambda x: x["airline_icao"] or "")],
+    }
+
+
+def build_answer_only(records, meta, route_pair, month=None, combine=False, validation=None):
+    """The anchor answer without the full comparison table. Same computation, projected."""
+    full = build_comparison(records, meta, route_pair=route_pair, month=month,
+                            combine=combine, validation=validation)
+    months = []
+    for block in full["months"]:
+        if "answer" in block:
+            months.append({"reference_month": block["reference_month"],
+                           "aggregation": block["aggregation"], "answer": block["answer"]})
+        else:
+            months.append({"reference_month": block["reference_month"],
+                           "aggregation": block["aggregation"], "answers": block["answers"]})
+    return {k: full[k] for k in ("response_contract", "response_version", "query",
+                                 "validation", "provenance", "warnings")} | {"months": months}
+
+
 def make_handler(records, meta, report=None):
     class Handler(BaseHTTPRequestHandler):
+        server_version = "market-intelligence-api/" + C3_RESPONSE_VERSION
+
         def _send(self, code, payload):
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _route(self, path, qs):
+            """Map a GET path to (status, payload). Raises BadRequest/NotFound."""
+            parts = [p for p in path.split("/") if p]
+
+            if path in ("/", ""):
+                return 200, {"service": "market-intelligence-api", "endpoints": ENDPOINTS}
+            if path == "/health":
+                return 200, {"status": "ok", "records_loaded": len(records),
+                             "c2_validation": (report or {}).get("status")}
+            if path == "/meta":
+                return 200, build_meta(records, meta, report)
+            if path == "/validation":
+                if report is None:
+                    return 503, {"error": "no C2 validation report available"}
+                return 200, report
+            if path == "/routes":
+                return 200, {"route_pairs": route_index(records, "iata")}
+
+            month = parse_month(qs.get("month", [None])[0])
+            combine = parse_bool(qs.get("combine", [None])[0], "combine")
+
+            if len(parts) == 3 and parts[0] == "routes":
+                if parts[2] == "punctuality":
+                    return 200, build_comparison(records, meta, route_pair=parts[1], month=month,
+                                                 combine=combine, validation=report)
+                if parts[2] == "most-reliable":
+                    return 200, build_answer_only(records, meta, route_pair=parts[1], month=month,
+                                                  combine=combine, validation=report)
+                if parts[2] == "airlines":
+                    return 200, build_airlines(records, meta, route_pair=parts[1], month=month)
+
+            raise NotFound("no such endpoint: %s" % path, endpoints=ENDPOINTS)
 
         def do_GET(self):
             parsed = urlparse(self.path)
-            parts = [p for p in parsed.path.split("/") if p]
-            if parsed.path == "/health":
-                return self._send(200, {"status": "ok", "records_loaded": len(records),
-                                        "c2_validation": (report or {}).get("status")})
-            if parsed.path == "/validation":
-                if report is None:
-                    return self._send(503, {"error": "no validation report available"})
-                return self._send(200, report)
-            # /routes/{PAIR}/punctuality
-            if len(parts) == 3 and parts[0] == "routes" and parts[2] == "punctuality":
-                qs = parse_qs(parsed.query)
-                month = qs.get("month", [None])[0]
-                combine = qs.get("combine", ["false"])[0].lower() in ("1", "true", "yes")
-                try:
-                    resp = build_comparison(records, meta, route_pair=parts[1], month=month,
-                                            combine=combine, validation=report)
-                except Exception as exc:  # noqa: BLE001
-                    return self._send(400, {"error": str(exc)})
-                return self._send(200, resp)
-            self._send(404, {"error": "not found",
-                             "usage": "GET /routes/{IATA-IATA}/punctuality?month=YYYY-MM&combine=true"})
+            try:
+                code, payload = self._route(parsed.path, parse_qs(parsed.query))
+            except BadRequest as exc:
+                return self._send(400, {"error": "bad request", "detail": str(exc)})
+            except NotFound as exc:
+                return self._send(404, dict({"error": "not found", "detail": str(exc)}, **exc.extra))
+            except Exception as exc:  # noqa: BLE001 - never leak a traceback to a caller
+                return self._send(500, {"error": "internal error", "detail": str(exc)})
+            return self._send(code, payload)
 
-        def do_POST(self):  # read-only surface
-            self._send(405, {"error": "read-only API; use GET"})
+        do_HEAD = do_GET
+
+        def _read_only(self):
+            self._send(405, {"error": "read-only API; use GET",
+                             "detail": "this service exposes C2 and never accepts writes"})
+
+        do_POST = do_PUT = do_PATCH = do_DELETE = _read_only
 
         def log_message(self, *args):
             pass
@@ -453,9 +652,11 @@ def make_handler(records, meta, report=None):
 def serve_http(records, meta, port, report=None):
     handler = make_handler(records, meta, report)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    print("Serving C2 read-only on http://127.0.0.1:%d" % port)
-    print("  GET /routes/CGH-SDU/punctuality?month=2023-06&combine=true")
-    print("  GET /health    (Ctrl-C to stop)")
+    print("Serving C2 read-only on http://127.0.0.1:%d  (C2 validation: %s)"
+          % (port, (report or {}).get("status")))
+    for e in ENDPOINTS:
+        print("  %s %s" % (e["method"], e["path"]))
+    print("(Ctrl-C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -504,8 +705,18 @@ def main(argv=None):
         serve_http(records, meta, args.port, report)
         return 0
 
-    resp = build_comparison(records, meta, route_pair=args.route, month=args.month,
-                            combine=args.combine, validation=report)
+    try:
+        resp = build_comparison(records, meta, route_pair=args.route, month=args.month,
+                                combine=args.combine, validation=report)
+    except BadRequest as exc:
+        print("ERROR: bad request: %s" % exc, file=sys.stderr)
+        return 2
+    except NotFound as exc:
+        print("ERROR: %s" % exc, file=sys.stderr)
+        for k, v in exc.extra.items():
+            print("  %s: %s" % (k, ", ".join(map(str, v)) if isinstance(v, list) else v), file=sys.stderr)
+        return 4
+
     if args.json:
         print(json.dumps(resp, ensure_ascii=False, indent=2))
     else:
