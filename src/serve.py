@@ -581,14 +581,34 @@ def make_handler(records, meta, report=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "market-intelligence-api/" + C3_RESPONSE_VERSION
 
-        def _send(self, code, payload):
+        def _send(self, code, payload, extra_headers=()):
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            for name, value in extra_headers:
+                self.send_header(name, value)
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+
+        def _drain_request_body(self):
+            """Consume the request body before replying.
+
+            A read-only surface still has to READ what the caller sent. Replying and
+            closing with unread bytes still in the socket makes the OS send an RST, and
+            the caller sees a connection reset instead of the 405 that explains this API
+            accepts no writes. A bodyless caller is unaffected.
+            """
+            try:
+                remaining = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                remaining = 0
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
 
         def _route(self, path, qs):
             """Map a GET path to (status, payload). Raises BadRequest/NotFound."""
@@ -638,8 +658,14 @@ def make_handler(records, meta, report=None):
         do_HEAD = do_GET
 
         def _read_only(self):
+            # A chunked body cannot be drained here; close rather than risk an RST.
+            if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+                self.close_connection = True
+            else:
+                self._drain_request_body()
             self._send(405, {"error": "read-only API; use GET",
-                             "detail": "this service exposes C2 and never accepts writes"})
+                             "detail": "this service exposes C2 and never accepts writes"},
+                       extra_headers=[("Allow", "GET, HEAD")])
 
         do_POST = do_PUT = do_PATCH = do_DELETE = _read_only
 

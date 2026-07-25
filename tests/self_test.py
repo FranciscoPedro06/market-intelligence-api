@@ -496,16 +496,29 @@ class TestHttp(unittest.TestCase):
         self.assertEqual(json.dumps(over_http, sort_keys=True), json.dumps(direct, sort_keys=True))
 
     def test_writes_are_rejected(self):
+        """405 must arrive as a readable response, not a connection reset.
+
+        A body large enough to sit in the socket buffer: if the handler replies without
+        draining it, the close sends an RST and the caller gets ConnectionAbortedError
+        instead of the 405 telling it this API takes no writes.
+        """
         import urllib.request
+        bodies = [b"", b"{}", b'{"payload":"' + b"a" * 200000 + b'"}']
         for method in ("POST", "PUT", "PATCH", "DELETE"):
-            with self.subTest(method):
-                req = urllib.request.Request("http://127.0.0.1:%d/routes/CGH-SDU/punctuality" % self.port,
-                                             data=b"{}", method=method)
-                try:
-                    urlopen(req, timeout=10)
-                    self.fail("%s should be rejected" % method)
-                except HTTPError as exc:
-                    self.assertEqual(exc.code, 405)
+            for body in bodies:
+                with self.subTest(method=method, body_bytes=len(body)):
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:%d/routes/CGH-SDU/punctuality" % self.port,
+                        data=body, method=method,
+                        headers={"Content-Type": "application/json"})
+                    try:
+                        urlopen(req, timeout=10)
+                        self.fail("%s should be rejected" % method)
+                    except HTTPError as exc:
+                        self.assertEqual(exc.code, 405)
+                        self.assertEqual(exc.headers.get("Allow"), "GET, HEAD")
+                        payload = json.loads(exc.read().decode("utf-8"))
+                        self.assertIn("read-only", payload["error"])
 
     def test_synthetic_input_is_flagged_in_every_response(self):
         _, body = self.get("/routes/CGH-SDU/punctuality")
