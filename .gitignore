@@ -1,8 +1,4 @@
-# OS / editor artifacts (tecnologia-agnóstico — stack ainda não definida)
-.DS_Store
-Thumbs.db
-desktop.ini
-*.swp
-*~
-.idea/
-.vscode/
+output/
+input/
+__pycache__/
+*.pyc
