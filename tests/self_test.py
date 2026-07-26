@@ -68,7 +68,8 @@ def make_record(airline="TAM", operated=100, on_time=80, month="2023-06",
 TEST_META = {"contract": "C2", "contract_version": "v1.0.0"}
 
 # The Analytics product's real C2 v1.1.0 output, if this checkout sits beside it.
-ANALYTICS_C2 = os.path.join(ROOT, os.pardir, "market-intelligence-analytics", "output", "c2_on_time.csv")
+# Canonical artifact name per contracts.md C2 -> "Artefato de referencia" (ADR-0001).
+ANALYTICS_C2 = os.path.join(ROOT, os.pardir, "market-intelligence-analytics", "output", "c2_punctuality.json")
 
 
 def make_v110_record(missing_schedule=0, **override):

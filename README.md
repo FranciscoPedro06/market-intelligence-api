@@ -155,11 +155,11 @@ python src/serve.py --input input/sample_c2.json --validate                  # r
 python src/serve.py --input input/sample_c2.json --validate --strict         # sai != 0 se houver erro
 ```
 Default de `--input`: `input/c2_punctuality.json`. O C2 real produzido pelo Analytics
-fica em `../market-intelligence-analytics/output/c2_on_time.csv` (conteúdo JSON) —
-passe-o com `--input` ou copie-o para `input/c2_punctuality.json`:
+fica em `../market-intelligence-analytics/output/c2_punctuality.json` — passe-o com
+`--input` ou copie-o para `input/c2_punctuality.json`:
 
 ```bash
-python src/serve.py --input ../market-intelligence-analytics/output/c2_on_time.csv \
+python src/serve.py --input ../market-intelligence-analytics/output/c2_punctuality.json \
     --route CGH-SDU --month 2023-06
 ```
 
@@ -184,7 +184,7 @@ python tests/self_test.py        # 54 casos, stdlib unittest, sem dependências
 ## Exemplo de saída (C2 `v1.1.0` real do Analytics)
 
 ```
-$ python src/serve.py --input ../market-intelligence-analytics/output/c2_on_time.csv \
+$ python src/serve.py --input ../market-intelligence-analytics/output/c2_punctuality.json \
       --route CGH-SDU --month 2023-06
 
 Route pair: CGH-SDU   month: 2023-06   mode: per-direction
@@ -245,7 +245,7 @@ transparência. Commitado via force-add (o `.gitignore` ignora `input/`).
    e o caso de voo não mensurável (denominador 0 → `on_time_rate = null`, companhia
    excluída da resposta).
 7. **Contra o C2 real do Analytics**, quando presente em
-   `../market-intelligence-analytics/output/c2_on_time.csv` (a classe é *skipped* se o
+   `../market-intelligence-analytics/output/c2_punctuality.json` (a classe é *skipped* se o
    arquivo não existir, para o suite não depender de um repo vizinho): validação sem
    erros, `metric_version = v1.1.0` em todos os registros, reconciliação dos 5 buckets
    e o caso `ACN` (`on_time_rate = null` com `flights_operated_missing_schedule > 0`
@@ -265,8 +265,12 @@ reconciliação manual conjunta contra o VRA (AC4) e revisão cruzada (DoD).
 **Observação para o Analytics** (não bloqueante): a saída é um array JSON puro, sem
 envelope `{"contract": "C2", "contract_version": "v1.1.0", "records": [...]}`, então a
 API avisa que não pode confirmar a versão do contrato pelo documento — só pelo
-`metric_version` de cada registro. Além disso `output/c2_on_time.csv` tem conteúdo
-**JSON**, não CSV, apesar da extensão.
+`metric_version` de cada registro. Decisão pendente: **ADR-0002** (Issue GOV-003).
+
+**Artefato do C2:** `c2_punctuality.json` é o artefato canônico do contrato, fixado em
+`contracts.md` §C2 → *Artefato de referência* (ADR-0001, aceito 2026-07-26). O antigo
+`c2_on_time.csv` está **descontinuado** — era a mesma saída sob outro nome, com extensão
+que não correspondia ao conteúdo.
 
 Contratos e governança:
 https://github.com/FranciscoPedro06/Market-Intelligence-Ecosystem
